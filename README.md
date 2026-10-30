@@ -63,39 +63,16 @@ npm install
 ```
 
 ### 3. Firebase Configuration
-Go to Firebase Console.
+Create a Firebase project, enable Email/Password Authentication and Firestore, then copy your web app configuration. Add these values to a `.env.local` file in the project root:
 
-Create a new project.
-
-Enable Authentication (Email/Password).
-
-Enable Firestore Database (Start in Test Mode).
-
-Copy your web app configuration keys.
-
-Create a file named src/firebase.js and paste your keys:
-
-JavaScript
+```env
+VITE_API_KEY=your-api-key
+VITE_PROJECT_ID=your-project-id
+VITE_MESSAGING_SENDER_ID=your-messaging-sender-id
+VITE_APP_ID=your-app-id
 ```
-// src/firebase.js
-import { initializeApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
 
-const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
-};
-
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-export const db = getFirestore(app);
-export default app;
-```
+`.env.local` is ignored by Git. Restart the Vite dev server after changing it. The public home page can load without Firebase configured, but authentication and dashboard data require valid Firebase values.
 ### 4. Run the App
 ```
 npm run dev

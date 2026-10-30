@@ -1,10 +1,8 @@
 // src/firebase.js
 
-// 1. Add imports for Auth and Firestore
 import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-import { getAuth } from "firebase/auth";       // <--- ADDED
-import { getFirestore } from "firebase/firestore"; // <--- ADDED
+import { getAuth } from "firebase/auth";
+import { getFirestore } from "firebase/firestore";
 
 const firebaseConfig = {
     apiKey: import.meta.env.VITE_API_KEY,
@@ -12,15 +10,14 @@ const firebaseConfig = {
     projectId: import.meta.env.VITE_PROJECT_ID,
     storageBucket: `${import.meta.env.VITE_PROJECT_ID}.firebasestorage.app`,
     messagingSenderId: import.meta.env.VITE_MESSAGING_SENDER_ID,
-    appId: import.meta.env.VITE_APP_ID,
-    measurementId: import.meta.env.VITE_MEASUREMENT_ID
+    appId: import.meta.env.VITE_APP_ID
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+export const firebaseConfigured = Boolean(
+    firebaseConfig.apiKey && firebaseConfig.projectId && firebaseConfig.appId
+);
+const app = firebaseConfigured ? initializeApp(firebaseConfig) : null;
 
-// 2. EXPORT Auth and Database so other files can use them
-export const auth = getAuth(app);      // <--- IMPORTANT!
-export const db = getFirestore(app);   // <--- IMPORTANT!
+export const auth = app ? getAuth(app) : null;
+export const db = app ? getFirestore(app) : null;
 export default app;

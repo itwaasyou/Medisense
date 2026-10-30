@@ -203,8 +203,7 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                             ...prev,
                             ...remoteVitals,
                             // Ensure ECG is kept if not provided by device, or update if it is
-                            ecg: remoteVitals.ecg || prev.ecg,
-                            ecg: remoteVitals.ecg !== undefined ? Number(remoteVitals.ecg) : 0,
+                            ecg: remoteVitals.ecg !== undefined ? Number(remoteVitals.ecg) : prev.ecg,
                             ecgPeak: remoteVitals.ecgPeak !== undefined ? Boolean(remoteVitals.ecgPeak) : false
                         }));
 
