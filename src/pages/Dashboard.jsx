@@ -123,6 +123,7 @@ const Dashboard = () => {
         return <MessagesView currentUser={user} />;
       case 'share':
         return <ShareDataView currentUser={user} />;
+      case 'analysis':
       case 'history':
         return <HistoryView currentUser={user} />;
       case 'appointments':
@@ -154,7 +155,7 @@ const Dashboard = () => {
 
   const patientNav = [
     { id: 'dashboard', label: 'My Vitals', icon: Activity },
-    { id: 'history', label: 'History', icon: Calendar }, // Placeholder
+    { id: 'analysis', label: 'Analysis', icon: BarChart3 },
     { id: 'appointments', label: 'Appointments', icon: Calendar },
     { id: 'message', label: 'Consult Doctor', icon: MessageSquare },
     { id: 'share', label: 'Share Data', icon: Share2 },

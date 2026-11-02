@@ -6,7 +6,7 @@ const ADC_MV_PER_LSB = 0.125;   // ADS1115 GAIN_ONE (±4.096 V)
 const FRONTEND_GAIN = 1100;     // AD8232 module. Change if yours differs
 const MAINS_HZ = 50;            // India
 const WINDOW_SEC = 6;           // seconds on screen
-const TARGET_LATENCY_SEC = 2;   // playback buffer (smooths 1 s network batches)
+const TARGET_LATENCY_SEC = 1;   // playback buffer (smooths 1 s network batches)
 const SWEEP_GAP_SEC = 0.15;     // blank gap ahead of the sweep line
 
 /* ---------- biquad filters (RBJ cookbook) ---------- */
