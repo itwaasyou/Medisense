@@ -1,19 +1,46 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Heart, Thermometer, Droplets, Share2, Activity, Wind, Zap, Settings, AlertCircle, Play, Square, Save, Link, X, Cloud } from 'lucide-react';
-import { Area, AreaChart, ComposedChart, ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
+import { Area, AreaChart, ComposedChart, ResponsiveContainer, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { db } from "../firebase";
 import { collection, addDoc, serverTimestamp, doc, updateDoc, getDoc, onSnapshot } from "firebase/firestore";
+import EcgMonitor from "./EcgMonitor";
+
+/* ---------- ECG simulator (same wire format as the ESP32: int16 LE -> base64) ---------- */
+const SIM_FS = 250;
+const SIM_BPM = 72;
+const SIM_MV_TO_COUNTS = 1100 / 0.125;   // must match FRONTEND_GAIN / ADC_MV_PER_LSB in EcgMonitor
+
+function makeSimEcgBatch(startIdx, n = SIM_FS) {
+    const period = Math.round((SIM_FS * 60) / SIM_BPM);
+    const g = (t, mu, sig, a) => a * Math.exp(-((t - mu) ** 2) / (2 * sig * sig));
+    const out = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+        const t = ((startIdx + i) % period) / SIM_FS;
+        const mv =
+            g(t, 0.16, 0.025, 0.12) +    // P
+            g(t, 0.245, 0.010, -0.12) +  // Q
+            g(t, 0.26, 0.012, 1.1) +     // R
+            g(t, 0.28, 0.012, -0.25) +   // S
+            g(t, 0.46, 0.045, 0.3) +     // T
+            (Math.random() - 0.5) * 0.02;
+        out[i] = Math.round(10000 + mv * SIM_MV_TO_COUNTS);
+    }
+    const bytes = new Uint8Array(out.buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+}
 
 const MyVitalsView = ({ currentUser, setActiveNav }) => {
-    // --- STATE FOR PATIENT VITALS (Simulation) ---
+    // --- STATE FOR PATIENT VITALS ---
     const [vitals, setVitals] = useState({
         heartRate: 0,
         spo2: 0,
         bodyTemp: 0,
         roomTemp: 0,
         humidity: 0,
-        ecg: 0,
-        ecgPeak: false
+        ecgPeak: false,
+        leadsOff: false
     });
 
     // --- DEVICE CONNECTION STATE ---
@@ -60,23 +87,30 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
     // Ref to track last live update time
     const lastLiveUpdate = useRef(0);
 
-    // Initialize with dummy data so the chart isn't empty on load
     const [history, setHistory] = useState([]);
 
-    // --- ECG DUMMY DATA STATE ---
-    const [ecgData, setEcgData] = useState(Array.from({ length: 100 }, () => ({ value: 2000 })));
-
-    // --- ECG CALIBRATION STATE ---
-    const [ecgCalibration, setEcgCalibration] = useState({ zoom: 1, offset: 0 });
+    // --- ECG STATE ---
+    // simEcg only used when no device is linked: { ecgB64, ecgSeq, ecgN, leadsOff }
+    const [simEcg, setSimEcg] = useState(null);
+    const [ecgCalibration, setEcgCalibration] = useState({ zoom: 1 });
     const [showCalibration, setShowCalibration] = useState(false);
 
+    // Source for the ECG renderer: real device data, or the simulator
+    const ecgSource = isDeviceLinked ? vitals : simEcg;
+
+    // Vitals without the (large) ECG waveform, for history / live-share writes
+    const stripEcgWave = (v) => {
+        // eslint-disable-next-line no-unused-vars
+        const { ecgB64, ecgSeq, ecgN, ecgFs, ...rest } = v;
+        return rest;
+    };
 
     // --- MANUAL SNAPSHOT ---
     const handleSaveSnapshot = async () => {
         if (!currentUser?.uid) return;
         try {
             await addDoc(collection(db, "users", currentUser.uid, "vitalsHistory"), {
-                ...vitals,
+                ...stripEcgWave(vitals),
                 timestamp: serverTimestamp(),
                 readableTime: new Date().toLocaleString(),
                 type: 'manual_snapshot'
@@ -111,13 +145,11 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
             if (docSnap.exists()) {
                 const deviceData = docSnap.data();
 
-                // Check if device is already assigned to another user
                 if (deviceData.ownerId && deviceData.ownerId !== currentUser.uid) {
                     setConnectError("Device is already assigned to another user.");
                     return;
                 }
 
-                // 1. Handshake: Write User ID to Registry (if not already assigned)
                 if (deviceData.ownerId !== currentUser.uid) {
                     await updateDoc(registryRef, {
                         ownerId: currentUser.uid,
@@ -126,7 +158,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     });
                 }
 
-                // 2. Save Device to User Profile (Persistence)
                 await updateDoc(doc(db, "users", currentUser.uid), {
                     connectedDeviceId: mac
                 });
@@ -151,21 +182,17 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
 
         setIsConnecting(true);
         try {
-            // 1. Remove User from Registry
             const registryRef = doc(db, "registry", connectedMacAddress);
-            // We attempt to update the registry. Even if the device is offline, this DB write should succeed.
             await updateDoc(registryRef, {
                 ownerId: null,
                 status: 'ready',
                 assignedAt: null
             });
 
-            // 2. Remove Device from User Profile
             await updateDoc(doc(db, "users", currentUser.uid), {
                 connectedDeviceId: null
             });
 
-            // 3. Reset Local State
             setIsDeviceLinked(false);
             setConnectedMacAddress("");
             setShowConnectModal(false);
@@ -174,7 +201,9 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                 spo2: 0,
                 bodyTemp: 0,
                 roomTemp: 0,
-                ecg: '--'
+                humidity: 0,
+                ecgPeak: false,
+                leadsOff: false
             });
             alert("Device disconnected successfully.");
         } catch (error) {
@@ -185,12 +214,11 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
         }
     };
 
-    // 1. DATA SOURCE ENGINE (Simulation vs Device Stream)
+    // 1. DATA SOURCE ENGINE (Device stream via Firestore)
     useEffect(() => {
         let unsubscribe;
 
         if (isDeviceLinked && currentUser?.uid) {
-            // --- DEVICE MODE: Listen to Firestore ---
             const userRef = doc(db, "users", currentUser.uid);
             unsubscribe = onSnapshot(userRef, (docSnap) => {
                 if (docSnap.exists()) {
@@ -198,16 +226,16 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     if (data?.currentVitals) {
                         const remoteVitals = data.currentVitals;
 
-                        // Update Vitals State
+                        // Merge everything, including ecgB64 / ecgSeq / ecgN / leadsOff.
+                        // EcgMonitor reads those directly from `vitals`.
                         setVitals(prev => ({
                             ...prev,
                             ...remoteVitals,
-                            // Ensure ECG is kept if not provided by device, or update if it is
-                            ecg: remoteVitals.ecg !== undefined ? Number(remoteVitals.ecg) : prev.ecg,
-                            ecgPeak: remoteVitals.ecgPeak !== undefined ? Boolean(remoteVitals.ecgPeak) : false
+                            ecgPeak: remoteVitals.ecgPeak !== undefined ? Boolean(remoteVitals.ecgPeak) : false,
+                            leadsOff: Boolean(remoteVitals.leadsOff)
                         }));
 
-                        // Update History for Chart
+                        // Trend history
                         const timestamp = remoteVitals.lastUpdated?.toDate
                             ? remoteVitals.lastUpdated.toDate()
                             : new Date();
@@ -225,20 +253,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                             }];
                             return newHistory.slice(-20);
                         });
-
-                        // Update ECG Chart Data
-                        if (remoteVitals.ecg !== undefined) {
-                            const raw = Number(remoteVitals.ecg);
-
-                            // 1️⃣ Center + scale ECG
-                            const ECG_SCALE = 4;        // adjust 3–6 if needed
-                            const ecgScaled = raw * ECG_SCALE;
-
-                            setEcgData(prev => {
-                                const next = [...prev, { value: ecgScaled }];
-                                return next.slice(-100); // smooth scrolling
-                            });
-                        }
                     }
                 }
             });
@@ -249,30 +263,22 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
         };
     }, [isDeviceLinked, currentUser?.uid]);
 
-    // 1.5 SIMULATION ENGINE (When no device is linked)
+    // 1.5 SIMULATION ENGINE (When no device is linked): one 250-sample batch per second
     useEffect(() => {
         if (isDeviceLinked) return;
 
-        let tick = 0;
-        const interval = setInterval(() => {
-            tick += 1;
-            setEcgData(prev => {
-                // Simulate a basic ECG pattern
-                // Baseline: 2000, P: +100, Q: -100, R: +800, S: -200, T: +150
-                let val = 2000 + Math.random() * 50; // Baseline + noise
-                const phase = tick % 20; // 20 ticks per beat (at 50ms interval = 1 beat/sec)
-
-                if (phase === 2) val += 100; // P
-                else if (phase === 4) val -= 100; // Q
-                else if (phase === 5) val += 800; // R
-                else if (phase === 6) val -= 200; // S
-                else if (phase === 10) val += 150; // T
-
-                const newData = [...prev, { value: val }];
-                return newData.slice(-100);
+        let seq = 0;
+        const emit = () => {
+            setSimEcg({
+                ecgB64: makeSimEcgBatch(seq, SIM_FS),
+                ecgSeq: seq,
+                ecgN: SIM_FS,
+                leadsOff: false
             });
-        }, 50);
-
+            seq += SIM_FS;
+        };
+        emit();
+        const interval = setInterval(emit, 1000);
         return () => clearInterval(interval);
     }, [isDeviceLinked]);
 
@@ -282,11 +288,12 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
 
         const handleUpload = async () => {
             const now = Date.now();
+            const lite = stripEcgWave(vitals);   // never store the waveform in history
 
             // A. RECORDING: Save to History Collection
             try {
                 await addDoc(collection(db, "users", currentUser.uid, "vitalsHistory"), {
-                    ...vitals,
+                    ...lite,
                     timestamp: serverTimestamp(),
                     readableTime: new Date().toLocaleString(),
                     type: 'auto_log'
@@ -295,14 +302,13 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                 console.error("Error recording history:", error);
             }
 
-            // B. LIVE SHARING: Update Current Vitals Node (Only if NO device is linked)
-            // If device is linked, IT updates the live node directly. We shouldn't overwrite it.
+            // B. LIVE SHARING: only when NO device is linked (the device writes the live node itself)
             if (!isDeviceLinked && isSharingLive && now - lastLiveUpdate.current >= 2000) {
                 try {
                     const userRef = doc(db, "users", currentUser.uid);
                     await updateDoc(userRef, {
                         currentVitals: {
-                            ...vitals,
+                            ...lite,
                             lastUpdated: serverTimestamp()
                         }
                     });
@@ -314,7 +320,8 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
         };
 
         handleUpload();
-    }, [vitals, isRecording, currentUser?.uid, isSharingLive, isDeviceLinked]); // Runs whenever 'vitals' updates (1s)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [vitals, isRecording, currentUser?.uid, isSharingLive, isDeviceLinked]);
 
     // 3. TIMER ENGINE (UI Only)
     useEffect(() => {
@@ -329,6 +336,7 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
         return () => clearInterval(interval);
     }, [isRecording]);
 
+    const ecgLeadsOff = isDeviceLinked && !!vitals.leadsOff;
 
     return (
         <div className="flex flex-col gap-6">
@@ -427,7 +435,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
 
             {/* Modern Vitals Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
-                {/* Heart Rate */}
                 <VitalCard
                     title="Heart Rate"
                     value={vitals.heartRate}
@@ -439,7 +446,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     dataKey="hr"
                 />
 
-                {/* SpO2 */}
                 <VitalCard
                     title="SpO2"
                     value={vitals.spo2}
@@ -451,7 +457,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     dataKey="spo2"
                 />
 
-                {/* Body Temp */}
                 <VitalCard
                     title="Body Temp"
                     value={vitals.bodyTemp}
@@ -463,7 +468,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     dataKey="bodyTemp"
                 />
 
-                {/* Room Temp */}
                 <VitalCard
                     title="Room Temp"
                     value={vitals.roomTemp}
@@ -475,7 +479,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     dataKey="roomTemp"
                 />
 
-                {/* Humidity */}
                 <VitalCard
                     title="Humidity"
                     value={vitals.humidity}
@@ -486,7 +489,6 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     chartData={history}
                     dataKey="humidity"
                 />
-
             </div>
 
             {/* Charts Section */}
@@ -527,20 +529,20 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                     </div>
                 </div>
 
-                {/* ECG Visualizer (Simulated) */}
+                {/* ECG Monitor */}
                 <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
                     <div className="flex items-center justify-between mb-4">
                         <div className="flex items-center gap-3">
                             <h3 className="font-bold text-gray-800">ECG Monitor</h3>
-                            <span className={`text-xs font-bold px-2 py-1 rounded-lg border uppercase tracking-wide ${vitals.ecgPeak ? 'bg-red-50 text-red-600 border-red-100' : 'bg-purple-50 text-purple-600 border-purple-100'}`}>
-                                {vitals.ecgPeak ? 'Peak Detected' : 'Rhythm: Normal'}
+                            <span className={`text-xs font-bold px-2 py-1 rounded-lg border uppercase tracking-wide ${ecgLeadsOff ? 'bg-red-50 text-red-600 border-red-100' : 'bg-purple-50 text-purple-600 border-purple-100'}`}>
+                                {ecgLeadsOff ? 'Leads Off' : isDeviceLinked ? 'Signal OK' : 'Simulated'}
                             </span>
                         </div>
                         <div className="flex items-center gap-3">
                             <button
                                 onClick={() => setShowCalibration(!showCalibration)}
                                 className={`p-1.5 rounded-lg transition-colors ${showCalibration ? 'bg-slate-100 text-slate-900' : 'text-slate-400 hover:bg-slate-50 hover:text-slate-600'}`}
-                                title="Calibrate Signal"
+                                title="Adjust amplitude"
                             >
                                 <Settings size={18} />
                             </button>
@@ -548,84 +550,47 @@ const MyVitalsView = ({ currentUser, setActiveNav }) => {
                         </div>
                     </div>
 
-                    <div className="flex-1 bg-gray-900 rounded-xl relative overflow-hidden flex items-center justify-center min-h-[200px]">
-                        {/* Grid Background */}
-                        <div className="absolute inset-0 opacity-20" style={{ backgroundImage: 'linear-gradient(#333 1px, transparent 1px), linear-gradient(90deg, #333 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
-
-                        {/* Simulated ECG Line */}
-                        <div className="absolute inset-0 flex items-center px-4">
-                            <div className="w-full h-[120px]">
-                                <ResponsiveContainer width="100%" height="100%">
-                                    <LineChart data={ecgData}>
-                                        <XAxis hide />
-                                        <YAxis
-                                            domain={[
-                                                (2000 + ecgCalibration.offset) - (1000 / ecgCalibration.zoom),
-                                                (2000 + ecgCalibration.offset) + (1000 / ecgCalibration.zoom)
-                                            ]}
-                                            hide
-                                        />
-                                        <Line
-                                            type="monotone"
-                                            dataKey="value"
-                                            stroke={vitals.ecgPeak ? "#ff2d2d" : "#10ff8a"}
-                                            strokeWidth={2}
-                                            dot={false}
-                                            isAnimationActive={false}
-                                        />
-                                    </LineChart>
-                                </ResponsiveContainer>
-                            </div>
-                        </div>
-
-                        <div className="absolute top-4 right-4 flex items-center gap-2">
+                    <div className="flex-1 bg-gray-900 rounded-xl relative overflow-hidden min-h-[200px]">
+                        <EcgMonitor
+                            key={isDeviceLinked ? 'device' : 'sim'}
+                            vitals={ecgSource}
+                            zoom={ecgCalibration.zoom}
+                            height={220}
+                        />
+                        <div className="absolute top-4 right-4 flex items-center gap-2 pointer-events-none">
                             <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-                            <span className="text-xs text-emerald-500 font-mono">LIVE</span>
+                            <span className="text-xs text-emerald-500 font-mono">{isDeviceLinked ? 'LIVE' : 'DEMO'}</span>
                         </div>
                     </div>
 
                     <div className="mt-4 grid grid-cols-2 gap-4">
                         <div className="bg-gray-50 p-3 rounded-xl">
-                            <p className="text-xs text-gray-500 mb-1">PR Interval</p>
-                            <p className="font-semibold text-gray-800">0.16s</p>
+                            <p className="text-xs text-gray-500 mb-1">Heart Rate</p>
+                            <p className="font-semibold text-gray-800">{vitals.heartRate ? `${vitals.heartRate} bpm` : '--'}</p>
                         </div>
                         <div className="bg-gray-50 p-3 rounded-xl">
-                            <p className="text-xs text-gray-500 mb-1">QRS Duration</p>
-                            <p className="font-semibold text-gray-800">0.09s</p>
+                            <p className="text-xs text-gray-500 mb-1">Sampling</p>
+                            <p className="font-semibold text-gray-800">250 Hz · 0.5–40 Hz</p>
                         </div>
                     </div>
 
                     {showCalibration && (
                         <div className="mt-4 p-4 bg-slate-50 rounded-xl border border-slate-100 animate-in slide-in-from-top-2 fade-in duration-200">
                             <div className="flex justify-between items-center mb-3">
-                                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Signal Calibration</h4>
-                                <button onClick={() => setEcgCalibration({ zoom: 1, offset: 0 })} className="text-[10px] font-medium text-blue-600 hover:underline">Reset</button>
+                                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Display</h4>
+                                <button onClick={() => setEcgCalibration({ zoom: 1 })} className="text-[10px] font-medium text-blue-600 hover:underline">Reset</button>
                             </div>
-                            <div className="space-y-4">
-                                <div>
-                                    <div className="flex justify-between text-xs mb-1.5">
-                                        <span className="text-slate-600 font-medium">Amplitude (Zoom)</span>
-                                        <span className="text-slate-900 font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200">{ecgCalibration.zoom.toFixed(1)}x</span>
-                                    </div>
-                                    <input
-                                        type="range" min="0.5" max="5" step="0.1"
-                                        value={ecgCalibration.zoom}
-                                        onChange={(e) => setEcgCalibration(prev => ({ ...prev, zoom: parseFloat(e.target.value) }))}
-                                        className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                                    />
+                            <div>
+                                <div className="flex justify-between text-xs mb-1.5">
+                                    <span className="text-slate-600 font-medium">Amplitude (Zoom)</span>
+                                    <span className="text-slate-900 font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200">{ecgCalibration.zoom.toFixed(1)}x</span>
                                 </div>
-                                <div>
-                                    <div className="flex justify-between text-xs mb-1.5">
-                                        <span className="text-slate-600 font-medium">Baseline (Offset)</span>
-                                        <span className="text-slate-900 font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200">{ecgCalibration.offset > 0 ? '+' : ''}{ecgCalibration.offset}</span>
-                                    </div>
-                                    <input
-                                        type="range" min="-2000" max="2000" step="50"
-                                        value={ecgCalibration.offset}
-                                        onChange={(e) => setEcgCalibration(prev => ({ ...prev, offset: parseInt(e.target.value) }))}
-                                        className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                                    />
-                                </div>
+                                <input
+                                    type="range" min="0.5" max="5" step="0.1"
+                                    value={ecgCalibration.zoom}
+                                    onChange={(e) => setEcgCalibration({ zoom: parseFloat(e.target.value) })}
+                                    className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                                />
                             </div>
                         </div>
                     )}
@@ -753,7 +718,6 @@ const VitalCard = ({ title, value, unit, icon, status, color, chartData, dataKey
                 </span>
             </div>
 
-            {/* Sparkline Chart */}
             {chartData && (
                 <div className="absolute bottom-0 left-0 right-0 h-24 opacity-10 group-hover:opacity-20 transition-opacity duration-500 pointer-events-none">
                     <ResponsiveContainer width="100%" height="100%">
