@@ -2,8 +2,9 @@
 
 A modern, role-based health monitoring platform built with **React + Vite** and **Firebase**. This application allows **Patients** to view their real-time health vitals (Heart Rate, SpO₂, Temperature) and **Doctors** to manage appointments and view patient lists via a centralized dashboard.
 
-![Project Status](https://img.shields.io/badge/Status-In%20Development-orange?style=flat-square)
-![License](https://img.shields.io/badge/License-CC_BY--NC_4.0-blue?style=flat-square)
+![Static Badge](https://img.shields.io/badge/Status-Prototype_Ready-brightgreen?style=for-the-badge)
+![GitHub License](https://img.shields.io/github/license/itwaasyou/Medisense?style=for-the-badge)
+
 
 ---
 
