@@ -1,15 +1,19 @@
 import { useEffect, useRef } from "react";
 
-/* ---------- constants: adjust to your hardware ---------- */
+/* ---------- constants ---------- */
 const FS = 250;                 // must match ECG_FS on the ESP32
-const ADC_MV_PER_LSB = 0.125;   // ADS1115 GAIN_ONE (±4.096 V)
-const FRONTEND_GAIN = 1100;     // AD8232 module. Change if yours differs
-const MAINS_HZ = 50;            // India
-const WINDOW_SEC = 6;           // seconds on screen
-const TARGET_LATENCY_SEC = 1;   // playback buffer (smooths 1 s network batches)
-const SWEEP_GAP_SEC = 0.15;     // blank gap ahead of the sweep line
+const ADC_MV_PER_LSB = 0.125;   // ADS1115 GAIN_ONE
+const FRONTEND_GAIN = 1100;     // AD8232 module
+const MAINS_HZ = 50;
+const WINDOW_SEC = 6;
+const TARGET_LATENCY_SEC = 2;
+const SWEEP_GAP_SEC = 0.15;
 
-/* ---------- biquad filters (RBJ cookbook) ---------- */
+const MIN_SPAN_MV = 0.2;        // never zoom in tighter than this (avoids amplifying noise)
+const FILL = 0.8;               // signal uses about 80% of the height
+const SMOOTH = true;            // light 3-point smoothing of the drawn line
+
+/* ---------- biquad filters ---------- */
 class Biquad {
     constructor(b0, b1, b2, a0, a1, a2) {
         this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0;
@@ -35,7 +39,7 @@ function makeBiquad(type, f0, Q) {
 }
 
 const makeChain = () => [
-    makeBiquad("hp", 0.5, 0.707),
+    makeBiquad("hp", 0.67, 0.707),
     makeBiquad("notch", MAINS_HZ, 30),
     makeBiquad("lp", 40, 0.707),
 ];
@@ -45,7 +49,7 @@ function runChain(chain, x) {
     return x;
 }
 
-function primeChain(chain, x) {            // settle filters on first sample, avoids a start-up spike
+function primeChain(chain, x) {
     for (let i = 0; i < 2000; i++) runChain(chain, x);
 }
 
@@ -56,25 +60,30 @@ function decodeEcg(b64) {
     const dv = new DataView(bytes.buffer);
     const n = bytes.length >> 1;
     const out = new Array(n);
-    for (let i = 0; i < n; i++) out[i] = dv.getInt16(i * 2, true); // little-endian
+    for (let i = 0; i < n; i++) out[i] = dv.getInt16(i * 2, true);
     return out;
 }
 
 /* ---------- component ---------- */
 /**
  * vitals: { ecgB64, ecgSeq, ecgN, leadsOff }
- * zoom: vertical zoom (1 = 3 mV full scale)
+ * zoom:   multiplies the auto scale (1 = auto fit)
+ * invert: flip the trace if R waves point downward
  */
-export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#10ff8a" }) {
+export default function EcgMonitor({
+    vitals, zoom = 1, height = 220, color = "#10ff8a", invert = false,
+}) {
     const canvasRef = useRef(null);
-    const propsRef = useRef({ zoom, color });
-    propsRef.current = { zoom, color };
+    const propsRef = useRef({ zoom, color, invert });
+    propsRef.current = { zoom, color, invert };
 
     const N = FS * WINDOW_SEC;
     const st = useRef({
         queue: [], qHead: 0, nextSeq: null, needPrime: true, playing: false, dropped: 0,
         chain: makeChain(),
         buf: new Float32Array(N).fill(NaN), head: 0,
+        view: { mid: 0, span: 1.5 },     // smoothed auto-scale state
+        lastScale: 0,
     });
 
     /* ---- ingest each new batch ---- */
@@ -83,13 +92,12 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
         const s = st.current;
         const seq = Number(vitals.ecgSeq);
         if (s.nextSeq !== null && seq < s.nextSeq - Number(vitals.ecgN)) {
-            // device rebooted (sequence restarted) -> reset everything
             s.queue = []; s.qHead = 0; s.nextSeq = null; s.playing = false;
             s.buf.fill(NaN); s.head = 0; s.needPrime = true;
         }
-        if (s.nextSeq !== null && seq + Number(vitals.ecgN) <= s.nextSeq) return; // duplicate snapshot
+        if (s.nextSeq !== null && seq + Number(vitals.ecgN) <= s.nextSeq) return;
         if (s.nextSeq !== null && seq > s.nextSeq) {
-            s.dropped += seq - s.nextSeq;       // samples lost between device and browser
+            s.dropped += seq - s.nextSeq;
             s.needPrime = true;
         }
         const samples = decodeEcg(vitals.ecgB64);
@@ -106,15 +114,43 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
 
         const pushSample = (raw) => {
             const s = st.current;
-            const mv = (raw * ADC_MV_PER_LSB) / FRONTEND_GAIN;      // ADC counts -> electrode mV
+            const mv = (raw * ADC_MV_PER_LSB) / FRONTEND_GAIN;
             if (s.needPrime) { primeChain(s.chain, mv); s.needPrime = false; }
             s.buf[s.head] = runChain(s.chain, mv);
             s.head = (s.head + 1) % N;
         };
 
-        const draw = () => {
+        // Update the auto scale from the visible window (robust: ignores the top/bottom 2%)
+        const updateView = (now) => {
             const s = st.current;
-            const { zoom, color } = propsRef.current;
+            if (now - s.lastScale < 150) return;
+            s.lastScale = now;
+
+            const vals = [];
+            for (let i = 0; i < N; i++) {
+                const v = s.buf[i];
+                if (!Number.isNaN(v)) vals.push(v);
+            }
+            if (vals.length < FS) return;           // wait for ~1 s of data
+            vals.sort((a, b) => a - b);
+            const lo = vals[Math.floor(vals.length * 0.02)];
+            const hi = vals[Math.floor(vals.length * 0.98)];
+            const med = vals[Math.floor(vals.length * 0.5)];
+
+            const targetMid = (lo + hi) / 2 * 0.5 + med * 0.5;   // between centre of range and median
+            const targetSpan = Math.max(hi - lo, MIN_SPAN_MV) / FILL;
+
+            const v = s.view;
+            // grow fast (signal got bigger), shrink slowly (signal got smaller)
+            v.span += (targetSpan - v.span) * (targetSpan > v.span ? 0.5 : 0.06);
+            v.mid += (targetMid - v.mid) * 0.1;
+        };
+
+        const draw = (now) => {
+            const s = st.current;
+            const { zoom, color, invert } = propsRef.current;
+            updateView(now);
+
             const dpr = window.devicePixelRatio || 1;
             const w = cvs.clientWidth, h = cvs.clientHeight;
             if (cvs.width !== Math.round(w * dpr) || cvs.height !== Math.round(h * dpr)) {
@@ -123,12 +159,14 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
 
-            const mvRange = 3 / zoom;                 // full height in mV
+            const mvRange = s.view.span / zoom;       // full height in mV
             const pxPerMv = h / mvRange;
             const pxPerSec = w / WINDOW_SEC;
+            const sign = invert ? -1 : 1;
 
-            // ECG paper grid: 0.04 s / 0.1 mV small, 0.2 s / 0.5 mV large
+            // ECG paper grid
             const grid = (stepPx, alpha, vertical) => {
+                if (stepPx < 3) return;                 // too dense to be useful
                 ctx.strokeStyle = `rgba(16,255,138,${alpha})`;
                 ctx.lineWidth = 1;
                 ctx.beginPath();
@@ -142,21 +180,34 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
             grid(pxPerSec * 0.04, 0.05, true); grid(pxPerMv * 0.1, 0.05, false);
             grid(pxPerSec * 0.2, 0.14, true); grid(pxPerMv * 0.5, 0.14, false);
 
-            // waveform (linear segments only, so R peaks stay sharp)
+            // waveform
             const gap = Math.floor(SWEEP_GAP_SEC * FS);
-            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+            ctx.save();
+            ctx.beginPath(); ctx.rect(0, 0, w, h); ctx.clip();   // never draw outside the box
+            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
             ctx.beginPath();
             let pen = false;
             for (let i = 0; i < N; i++) {
                 const ahead = (i - s.head + N) % N < gap;
-                const v = s.buf[i];
+                let v = s.buf[i];
                 if (ahead || Number.isNaN(v) || i === 0) pen = false;
                 if (ahead || Number.isNaN(v)) continue;
+
+                if (SMOOTH) {
+                    const a = s.buf[(i - 1 + N) % N], b = s.buf[(i + 1) % N];
+                    if (!Number.isNaN(a) && !Number.isNaN(b)) v = (a + 2 * v + b) / 4;
+                }
                 const x = (i / N) * w;
-                const y = h / 2 - v * pxPerMv;
+                const y = h / 2 - sign * (v - s.view.mid) * pxPerMv;
                 if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
             }
             ctx.stroke();
+            ctx.restore();
+
+            // scale label
+            ctx.fillStyle = "rgba(16,255,138,0.6)";
+            ctx.font = "10px monospace";
+            ctx.fillText(`${mvRange.toFixed(2)} mV full scale`, 8, h - 8);
         };
 
         const tick = (t) => {
@@ -168,18 +219,17 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
             if (!s.playing && qLen >= TARGET_LATENCY_SEC * FS) s.playing = true;
 
             if (s.playing) {
-                // gently speed up / slow down to hold the target buffer
                 const err = qLen / FS - TARGET_LATENCY_SEC;
                 const rate = 1 + Math.max(-0.1, Math.min(0.2, err * 0.05));
                 acc += dt * FS * rate;
                 let n = Math.floor(acc);
                 acc -= n;
                 while (n-- > 0 && s.qHead < s.queue.length) pushSample(s.queue[s.qHead++]);
-                if (s.qHead >= s.queue.length) s.playing = false;   // starved: rebuffer
+                if (s.qHead >= s.queue.length) s.playing = false;
                 if (s.qHead > 4000) { s.queue = s.queue.slice(s.qHead); s.qHead = 0; }
             }
 
-            draw();
+            draw(t);
             raf = requestAnimationFrame(tick);
         };
         raf = requestAnimationFrame(tick);
@@ -193,7 +243,7 @@ export default function EcgMonitor({ vitals, zoom = 1, height = 220, color = "#1
                 <div style={{
                     position: "absolute", inset: 0, display: "flex", alignItems: "center",
                     justifyContent: "center", color: "#ff2d2d", fontWeight: 700, letterSpacing: 2,
-                    background: "rgba(0,0,0,0.45)",
+                    background: "rgba(0,0,0,0.15)",
                 }}>
                     LEADS OFF
                 </div>
